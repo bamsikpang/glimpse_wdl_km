@@ -6,14 +6,15 @@ version 1.0
 ## chromosome. Reproduces the chr22 pilot procedure that yielded 167,215 sites.
 ##
 ## Site selection is the union of two criteria on the HGDP+1KGP panel:
-##   - MAF >= 0.01 in the full 4,151-sample panel
-##   - MAF >= 0.01 in the 808 East Asian samples
-## The union matters because ~13% of EAS-common variants fall below 1% globally
-## and would otherwise be dropped from a Korean cohort.
+##   - MAF >= 0.01 across all 4,151 samples
+##   - MAF >= 0.01 within the 808 East Asian samples
+## The union matters because roughly 13% of EAS-common variants sit below 1%
+## globally and would otherwise vanish from a Korean cohort.
 ##
-## Outputs per chromosome: sites.vcf.gz (for chunking and mpileup targeting),
-## sites.tsv.gz (for bcftools call -T), panel.bcf (genotypes at those sites),
-## chunks.txt, and the binary reference files consumed by GLIMPSE2_phase.
+## Per chromosome this emits sites.vcf.gz (drives chunking and mpileup
+## targeting), sites.tsv.gz (for bcftools call -T), panel.bcf (genotypes at
+## those sites), chunks.txt, and a tarball of the binary reference files that
+## GLIMPSE2_phase consumes.
 
 workflow PrepareReference {
   input {
@@ -53,15 +54,15 @@ workflow PrepareReference {
   }
 
   output {
-    Array[File]       sites_vcf   = ExtractSites.sites_vcf
-    Array[File]       sites_index = ExtractSites.sites_vcf_index
-    Array[File]       sites_tsv   = ExtractSites.sites_tsv
-    Array[File]       sites_tsv_index = ExtractSites.sites_tsv_index
-    Array[File]       panel_bcf   = ExtractSites.panel_bcf
-    Array[File]       panel_index = ExtractSites.panel_bcf_index
-    Array[Int]        n_sites     = ExtractSites.n_sites
-    Array[File]       chunks      = ChunkAndSplit.chunks
-    Array[Array[File]] ref_bins   = ChunkAndSplit.ref_bins
+    Array[File] out_sites_vcf       = ExtractSites.sites_vcf
+    Array[File] out_sites_vcf_index = ExtractSites.sites_vcf_index
+    Array[File] out_sites_tsv       = ExtractSites.sites_tsv
+    Array[File] out_sites_tsv_index = ExtractSites.sites_tsv_index
+    Array[File] out_panel_bcf       = ExtractSites.panel_bcf
+    Array[File] out_panel_bcf_index = ExtractSites.panel_bcf_index
+    Array[Int]  out_n_sites         = ExtractSites.n_sites
+    Array[File] out_chunks          = ChunkAndSplit.chunks
+    Array[File] out_ref_bins        = ChunkAndSplit.ref_bins
   }
 }
 
@@ -76,24 +77,25 @@ task ExtractSites {
     String docker
   }
 
-  Float  vcf_gb  = size(panel_vcf, "GB")
-  Int    disk_gb = ceil(vcf_gb * 2 + 60)
+  # Arithmetic stays out of the command placeholders: the WDL parser reads
+  # "1.0" inside ~{ } as member access on the integer 1 and rejects the file.
+  Float maf_max = 1.0 - maf_min
+  Int   disk_gb = ceil(size(panel_vcf, "GB") * 2 + 60)
 
   command <<<
     set -euo pipefail
 
-    # bcftools +fill-tags computes per-group AF when handed a two-column
-    # sample-to-group file. Everyone not listed is ignored for the group tag,
-    # so only the EAS samples contribute to AF_eas.
+    # bcftools +fill-tags derives a per-group AF when given a sample-to-group
+    # table. Samples absent from the table contribute nothing to AF_eas.
     awk '{print $1"\teas"}' ~{eas_samples} > eas_group.txt
     wc -l eas_group.txt
 
-    # One pass over the panel: restrict to biallelic SNPs, add AF_eas, then
-    # keep any site common in either the full panel or the EAS subset.
+    # Single pass over the panel: biallelic SNPs, add AF_eas, then keep sites
+    # common in either the whole panel or the East Asian subset.
     bcftools view -m2 -M2 -v snps -Ou ~{panel_vcf} \
       | bcftools +fill-tags -Ou -- -t AF -S eas_group.txt \
       | bcftools view \
-          -i 'INFO/AF >= ~{maf_min} && INFO/AF <= ~{1.0 - maf_min} || INFO/AF_eas >= ~{maf_min} && INFO/AF_eas <= ~{1.0 - maf_min}' \
+          -i 'INFO/AF >= ~{maf_min} && INFO/AF <= ~{maf_max} || INFO/AF_eas >= ~{maf_min} && INFO/AF_eas <= ~{maf_max}' \
           -Ob -o filtered.bcf
     bcftools index -f filtered.bcf
 
@@ -101,17 +103,15 @@ task ExtractSites {
     echo "$N" > n_sites.txt
     echo "sites kept on ~{chrom}: $N"
 
-    # Genotypes only. Everything downstream reads GT; the gnomAD annotations
-    # would otherwise carry ~55 GB of dead weight through every phase shard.
+    # Genotypes only. The gnomAD annotations would otherwise drag ~55 GB of
+    # dead weight through every downstream phase shard.
     bcftools annotate -x INFO,^FORMAT/GT -Ob -o panel_~{chrom}.bcf filtered.bcf
     bcftools index -f panel_~{chrom}.bcf
 
-    # Sites-only VCF drives GLIMPSE2_chunk and targets bcftools mpileup.
     bcftools view -G -Oz -o sites_~{chrom}.vcf.gz filtered.bcf
     bcftools index -f -t sites_~{chrom}.vcf.gz
 
-    # The TSV form is what `bcftools call -C alleles -T` expects: REF and the
-    # comma-joined ALT in a single column.
+    # bcftools call -C alleles -T wants REF and comma-joined ALT in one column.
     bcftools query -f '%CHROM\t%POS\t%REF,%ALT\n' filtered.bcf \
       | bgzip -c > sites_~{chrom}.tsv.gz
     tabix -s1 -b2 -e2 -f sites_~{chrom}.tsv.gz
@@ -123,18 +123,18 @@ task ExtractSites {
     docker: docker
     cpu: 4
     memory: "16 GB"
-    disks: "local-disk " + disk_gb + " SSD"
+    disks: "local-disk ~{disk_gb} SSD"
     preemptible: 2
     maxRetries: 1
   }
 
   output {
-    File sites_vcf       = "sites_" + chrom + ".vcf.gz"
-    File sites_vcf_index = "sites_" + chrom + ".vcf.gz.tbi"
-    File sites_tsv       = "sites_" + chrom + ".tsv.gz"
-    File sites_tsv_index = "sites_" + chrom + ".tsv.gz.tbi"
-    File panel_bcf       = "panel_" + chrom + ".bcf"
-    File panel_bcf_index = "panel_" + chrom + ".bcf.csi"
+    File sites_vcf       = "sites_~{chrom}.vcf.gz"
+    File sites_vcf_index = "sites_~{chrom}.vcf.gz.tbi"
+    File sites_tsv       = "sites_~{chrom}.tsv.gz"
+    File sites_tsv_index = "sites_~{chrom}.tsv.gz.tbi"
+    File panel_bcf       = "panel_~{chrom}.bcf"
+    File panel_bcf_index = "panel_~{chrom}.bcf.csi"
     Int  n_sites         = read_int("n_sites.txt")
   }
 }
@@ -156,7 +156,7 @@ task ChunkAndSplit {
   command <<<
     set -euo pipefail
 
-    # Index files must sit beside their data files for htslib to find them.
+    # htslib looks for an index beside its data file, so link both together.
     ln -s ~{sites_vcf}   ./sites.vcf.gz
     ln -s ~{sites_index} ./sites.vcf.gz.tbi
     ln -s ~{panel_bcf}   ./panel.bcf
@@ -170,10 +170,11 @@ task ChunkAndSplit {
       --threads 4 \
       --output chunks_~{chrom}.txt
 
-    echo "chunks:"; cat chunks_~{chrom}.txt
+    echo "chunks:"
+    cat chunks_~{chrom}.txt
 
-    # Column 3 is the buffered region, column 4 the region GLIMPSE2 will
-    # actually emit. split_reference wants both.
+    # Column 3 is the buffered region GLIMPSE2 reads, column 4 the region it
+    # will emit. split_reference needs both.
     while IFS=$'\t' read -r ID CHR IRG ORG REST; do
       GLIMPSE2_split_reference_static \
         --reference ./panel.bcf \
@@ -186,19 +187,25 @@ task ChunkAndSplit {
 
     ls -lh reference_~{chrom}*.bin
     ls reference_~{chrom}*.bin | wc -l
+
+    # One tarball instead of a glob: nested File arrays trip some parsers, and
+    # phase will untar these anyway.
+    mkdir -p refbins
+    mv reference_~{chrom}*.bin refbins/
+    tar czf refbins_~{chrom}.tar.gz refbins
   >>>
 
   runtime {
     docker: docker
     cpu: 4
     memory: "32 GB"
-    disks: "local-disk " + disk_gb + " SSD"
+    disks: "local-disk ~{disk_gb} SSD"
     preemptible: 2
     maxRetries: 1
   }
 
   output {
-    File        chunks   = "chunks_" + chrom + ".txt"
-    Array[File] ref_bins = glob("reference_" + chrom + "*.bin")
+    File chunks   = "chunks_~{chrom}.txt"
+    File ref_bins = "refbins_~{chrom}.tar.gz"
   }
 }
