@@ -1,0 +1,6 @@
+version: 1.2
+workflows:
+  - name: PrepareReference
+    subclass: WDL
+    primaryDescriptorPath: /PrepareReference.wdl
+    publish: true
