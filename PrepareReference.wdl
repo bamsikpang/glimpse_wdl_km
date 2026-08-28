@@ -122,8 +122,12 @@ task ExtractSites {
     # Genotypes only for the panel that phase will read.
     bcftools annotate -x INFO,^FORMAT/GT -Ob -o panel_~{chrom}.bcf filtered.bcf
     bcftools index -f panel_~{chrom}.bcf
-
-    bcftools view -G -Oz -o sites_~{chrom}.vcf.gz filtered.bcf
+    
+    # GLIMPSE2_chunk aborts without AC/AN in INFO, which is why the pilot's
+    # sites VCF carried exactly those two fields and nothing else.
+    bcftools +fill-tags -Ou filtered.bcf -- -t AC,AN \
+      | bcftools annotate -x INFO/AF,INFO/AF_eas -Ou \
+      | bcftools view -G -Oz -o sites_~{chrom}.vcf.gz
     bcftools index -f -t sites_~{chrom}.vcf.gz
 
     # bcftools call -C alleles -T wants REF and comma-joined ALT in one column.
