@@ -121,10 +121,10 @@ task ExtractSites {
 
   runtime {
     docker: docker
-    cpu: 4
-    memory: "16 GB"
+    cpu: 8
+    memory: "32 GB"
     disks: "local-disk ~{disk_gb} SSD"
-    preemptible: 2
+    preemptible: 0
     maxRetries: 1
   }
 
@@ -197,10 +197,10 @@ task ChunkAndSplit {
 
   runtime {
     docker: docker
-    cpu: 4
+    cpu: 8
     memory: "32 GB"
     disks: "local-disk ~{disk_gb} SSD"
-    preemptible: 2
+    preemptible: 0
     maxRetries: 1
   }
 
