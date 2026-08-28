@@ -3,13 +3,15 @@ version 1.0
 ## PrepareReference.wdl
 ##
 ## Builds the GLIMPSE2 reference panel for low-pass imputation, one shard per
-## chromosome. Reproduces the chr22 pilot procedure that yielded 167,215 sites.
+## chromosome, from the gnomAD v3.1.2 HGDP+1KGP release (4,151 samples).
 ##
-## Site selection is the union of two criteria on the HGDP+1KGP panel:
-##   - MAF >= 0.01 across all 4,151 samples
+## Site selection keeps biallelic SNPs that pass gnomAD's own filters and are
+## common in either stratum:
+##   - MAF >= 0.01 across all 4,151 samples, or
 ##   - MAF >= 0.01 within the 808 East Asian samples
 ## The union matters because roughly 13% of EAS-common variants sit below 1%
-## globally and would otherwise vanish from a Korean cohort.
+## globally and would otherwise vanish from a Korean cohort. The chr22 pilot
+## run under these criteria retained 170,856 sites.
 ##
 ## Per chromosome this emits sites.vcf.gz (drives chunking and mpileup
 ## targeting), sites.tsv.gz (for bcftools call -T), panel.bcf (genotypes at
@@ -85,14 +87,28 @@ task ExtractSites {
   command <<<
     set -euo pipefail
 
-    # bcftools +fill-tags derives a per-group AF when given a sample-to-group
-    # table. Samples absent from the table contribute nothing to AF_eas.
+    # Fail loudly and early if the image is missing something. A bare
+    # "command not found" surfaces as exit 127 with no indication of which
+    # tool was absent.
+    for t in bcftools bgzip tabix; do
+      command -v $t || echo "MISSING: $t"
+    done
+    bcftools plugin -l 2>/dev/null | grep -i fill-tags || echo "MISSING: fill-tags plugin"
+
+    # bcftools +fill-tags derives a per-group AF from a sample-to-group table.
+    # Samples absent from the table contribute nothing to AF_eas.
     awk '{print $1"\teas"}' ~{eas_samples} > eas_group.txt
     wc -l eas_group.txt
 
-    # Single pass over the panel: biallelic SNPs, add AF_eas, then keep sites
-    # common in either the whole panel or the East Asian subset.
-    bcftools view -m2 -M2 -v snps -Ou ~{panel_vcf} \
+    # One pass over the panel. Three things happen in order and the order
+    # matters: -f PASS drops sites gnomAD flagged (AC0, AS_VQSR,
+    # InbreedingCoeff), which otherwise nearly doubles the site count with
+    # low-quality calls near the centromere; annotate -x INFO clears gnomAD's
+    # per-population annotations before fill-tags recomputes AF and AF_eas,
+    # so the filter reads freshly computed values and the sites VCF stays in
+    # the megabytes rather than the gigabytes.
+    bcftools view -m2 -M2 -v snps -f PASS -Ou ~{panel_vcf} \
+      | bcftools annotate -x INFO -Ou \
       | bcftools +fill-tags -Ou -- -t AF -S eas_group.txt \
       | bcftools view \
           -i 'INFO/AF >= ~{maf_min} && INFO/AF <= ~{maf_max} || INFO/AF_eas >= ~{maf_min} && INFO/AF_eas <= ~{maf_max}' \
@@ -103,8 +119,7 @@ task ExtractSites {
     echo "$N" > n_sites.txt
     echo "sites kept on ~{chrom}: $N"
 
-    # Genotypes only. The gnomAD annotations would otherwise drag ~55 GB of
-    # dead weight through every downstream phase shard.
+    # Genotypes only for the panel that phase will read.
     bcftools annotate -x INFO,^FORMAT/GT -Ob -o panel_~{chrom}.bcf filtered.bcf
     bcftools index -f panel_~{chrom}.bcf
 
@@ -124,6 +139,8 @@ task ExtractSites {
     cpu: 8
     memory: "32 GB"
     disks: "local-disk ~{disk_gb} SSD"
+    # Streaming 55 GB through three piped bcftools stages runs ~1.5 h, long
+    # enough that preemptible VMs were reclaimed twice before finishing.
     preemptible: 0
     maxRetries: 1
   }
@@ -156,13 +173,21 @@ task ChunkAndSplit {
   command <<<
     set -euo pipefail
 
+    # Release tarballs name the binaries GLIMPSE2_chunk_static; images built
+    # from source drop the suffix. Resolve at runtime and print what was
+    # found so a miss is diagnosable from the log.
+    ls -1 /usr/local/bin /usr/bin /opt/*/bin 2>/dev/null | grep -i glimpse || true
+    CHUNK=$(command -v GLIMPSE2_chunk_static || command -v GLIMPSE2_chunk)
+    SPLIT=$(command -v GLIMPSE2_split_reference_static || command -v GLIMPSE2_split_reference)
+    echo "chunk=$CHUNK  split=$SPLIT"
+
     # htslib looks for an index beside its data file, so link both together.
     ln -s ~{sites_vcf}   ./sites.vcf.gz
     ln -s ~{sites_index} ./sites.vcf.gz.tbi
     ln -s ~{panel_bcf}   ./panel.bcf
     ln -s ~{panel_index} ./panel.bcf.csi
 
-    GLIMPSE2_chunk_static \
+    "$CHUNK" \
       --input ./sites.vcf.gz \
       --region ~{chrom} \
       --map ~{gmap} \
@@ -176,7 +201,7 @@ task ChunkAndSplit {
     # Column 3 is the buffered region GLIMPSE2 reads, column 4 the region it
     # will emit. split_reference needs both.
     while IFS=$'\t' read -r ID CHR IRG ORG REST; do
-      GLIMPSE2_split_reference_static \
+      "$SPLIT" \
         --reference ./panel.bcf \
         --map ~{gmap} \
         --input-region  "$IRG" \
@@ -188,8 +213,8 @@ task ChunkAndSplit {
     ls -lh reference_~{chrom}*.bin
     ls reference_~{chrom}*.bin | wc -l
 
-    # One tarball instead of a glob: nested File arrays trip some parsers, and
-    # phase will untar these anyway.
+    # One tarball instead of a glob: nested File arrays trip some parsers,
+    # and phase unpacks these anyway.
     mkdir -p refbins
     mv reference_~{chrom}*.bin refbins/
     tar czf refbins_~{chrom}.tar.gz refbins
@@ -197,10 +222,10 @@ task ChunkAndSplit {
 
   runtime {
     docker: docker
-    cpu: 8
+    cpu: 4
     memory: "32 GB"
     disks: "local-disk ~{disk_gb} SSD"
-    preemptible: 0
+    preemptible: 2
     maxRetries: 1
   }
 
