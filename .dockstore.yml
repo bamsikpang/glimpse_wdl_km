@@ -4,3 +4,7 @@ workflows:
     subclass: WDL
     primaryDescriptorPath: /PrepareReference.wdl
     publish: true
+  - name: ComputeGL
+    subclass: WDL
+    primaryDescriptorPath: /ComputeGL.wdl
+    publish: true
