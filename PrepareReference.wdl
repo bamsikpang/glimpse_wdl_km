@@ -117,16 +117,19 @@ task ExtractSites {
     echo "$N" > n_sites.txt
     echo "sites kept on ~{chrom}: $N"
 
-    # Panel for split_reference: genotypes plus AC/AN, nothing else.
-    bcftools +fill-tags -Ou filtered.bcf -- -t AC,AN \
-      | bcftools annotate -x INFO/AF,INFO/AF_eas,^FORMAT/GT \
-          -Ob -o panel_~{chrom}.bcf
+    # Strip INFO first, then let fill-tags derive AC/AN from exactly the
+    # genotypes that remain. Computing them before the strip left the two
+    # out of step, and split_reference cross-checks AC/AN against GT.
+    # Missing calls are set to reference: GLIMPSE2 expects a complete
+    # haplotype panel, and any './.' left in place makes AN disagree.
+    bcftools annotate -x INFO,^FORMAT/GT -Ou filtered.bcf \
+      | bcftools +setGT -Ou -- -t . -n 0p \
+      | bcftools +fill-tags -Ob -o panel_~{chrom}.bcf -- -t AC,AN
     bcftools index -f panel_~{chrom}.bcf
 
-    # Sites VCF for chunk and for mpileup targeting: AC/AN, no genotypes.
-    bcftools +fill-tags -Ou filtered.bcf -- -t AC,AN \
-      | bcftools annotate -x INFO/AF,INFO/AF_eas -Ou \
-      | bcftools view -G -Oz -o sites_~{chrom}.vcf.gz
+    # The sites VCF is the panel with genotypes dropped, so its AC/AN match
+    # the panel's by construction.
+    bcftools view -G -Oz -o sites_~{chrom}.vcf.gz panel_~{chrom}.bcf
     bcftools index -f -t sites_~{chrom}.vcf.gz
 
     # bcftools call -C alleles -T wants REF and comma-joined ALT in one column.
