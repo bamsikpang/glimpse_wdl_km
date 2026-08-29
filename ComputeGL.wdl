@@ -80,7 +80,7 @@ task ReadManifest {
     cpu: 1
     memory: "2 GB"
     disks: "local-disk 10 HDD"
-    preemptible: 3
+    preemptible: 0
   }
 
   output {
