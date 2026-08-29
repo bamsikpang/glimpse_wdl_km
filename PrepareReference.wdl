@@ -20,7 +20,7 @@ version 1.0
 
 workflow PrepareReference {
   input {
-    Array[String] chroms = ["chr22"]
+    Array[String] chroms = ["chr1","chr2","chr3","chr4","chr5","chr6","chr7","chr8","chr9","chr10", "chr11","chr12","chr13","chr14","chr15","chr16","chr17","chr18","chr19", "chr20","chr21"]
 
     String panel_prefix = "gs://gcp-public-data--gnomad/release/3.1.2/vcf/genomes/gnomad.genomes.v3.1.2.hgdp_tgp"
     File   eas_samples
