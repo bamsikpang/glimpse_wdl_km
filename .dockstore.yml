@@ -8,3 +8,4 @@ workflows:
     subclass: WDL
     primaryDescriptorPath: /ComputeGL.wdl
     publish: true
+    
