@@ -2,19 +2,23 @@ version 1.0
 
 ## ComputeGL.wdl
 ##
-## Computes genotype likelihoods at the reference panel sites for each sample,
-## as input to GLIMPSE2_phase.
+## Computes genotype likelihoods at reference-panel sites for each sample,
+## feeding GLIMPSE2_phase.
 ##
-## The scatter is over samples rather than over sample-by-chromosome pairs.
-## A CRAM is 2.78 GB and the pilot showed localization dominating runtime;
-## splitting by chromosome would move 148 TB instead of 6.7 TB and gain
-## nothing, since the per-chromosome pileups are cheap once the file is on
-## local disk.
+## Scatter is over samples, not over sample-by-chromosome pairs. A CRAM is
+## 2.78 GB and the earlier hand-run pilot showed localization dominating
+## runtime; splitting by chromosome would move 148 TB instead of 6.7 TB while
+## the per-chromosome pileups themselves are cheap once the file is local.
 ##
 ## The 88 site files (22 chromosomes x 4) arrive as one 198 MB tarball. The
-## bcftools image has no gsutil, so fetching them inside the task is not an
-## option, and passing 88 separate File inputs would make the chromosome-to-
-## file pairing fragile.
+## bcftools image carries no gsutil, so fetching them inside the task is not
+## available, and 88 separate File inputs would make chromosome-to-file
+## pairing fragile.
+##
+## Default chroms is chr22 alone. That chromosome already has a hand-run
+## reference point (873 s per sample, 222,313 sites) to check this pipeline
+## against, and it costs 15 minutes per sample instead of hours. Override
+## chroms in the inputs JSON to run the full set.
 
 workflow ComputeGL {
   input {
@@ -23,10 +27,7 @@ workflow ComputeGL {
     File   ref_fasta
     File   ref_fasta_index
 
-    Array[String] chroms = ["chr1","chr2","chr3","chr4","chr5","chr6","chr7",
-                            "chr8","chr9","chr10","chr11","chr12","chr13",
-                            "chr14","chr15","chr16","chr17","chr18","chr19",
-                            "chr20","chr21","chr22"]
+    Array[String] chroms = ["chr22"]
 
     Int    mapq_min  = 30
     Int    baseq_min = 20
@@ -72,7 +73,8 @@ task ReadManifest {
   command <<<
     set -euo pipefail
     tail -n +2 ~{manifest} | awk -F'\t' 'NF>=3 {print $1"\t"$2"\t"$3}' > rows.tsv
-    wc -l rows.tsv
+    echo "samples: $(wc -l < rows.tsv)"
+    head -2 rows.tsv
   >>>
 
   runtime {
@@ -80,7 +82,8 @@ task ReadManifest {
     cpu: 1
     memory: "2 GB"
     disks: "local-disk 10 HDD"
-    preemptible: 0
+    # Seconds of work; preemption has no window in which to bite.
+    preemptible: 3
   }
 
   output {
@@ -103,23 +106,28 @@ task SampleGL {
     String docker
   }
 
-  # CRAM, reference, unpacked sites, 22 small BCFs, and the output tarball.
+  # CRAM, reference, unpacked sites, per-chromosome BCFs, output tarball.
   Int disk_gb = ceil(size(cram, "GB") + size(ref_fasta, "GB") + size(sites_tar, "GB") * 3 + 20)
 
   command <<<
     set -euo pipefail
 
+    # A bare "command not found" surfaces as exit 127 with no indication of
+    # which tool was absent, so name them up front.
     for t in bcftools bgzip tabix; do
       command -v $t || echo "MISSING: $t"
     done
 
-    # Point htslib at the local FASTA rather than letting it try to fetch
-    # reference sequences over the network.
-    export REF_PATH=/dev/null
-    export REF_CACHE=/dev/null
+    # htslib resolves CRAM reference sequences through REF_CACHE, and when
+    # that is unset it will try the EBI over the network one checksum at a
+    # time. Point it at a local directory so -f supplies the sequence and
+    # repeated chromosomes reuse what was already read.
+    mkdir -p ref_cache
+    export REF_CACHE=$PWD/ref_cache/%2s/%2s/%s
+    export REF_PATH=$PWD/ref_cache/%2s/%2s/%s
 
     tar xzf ~{sites_tar}
-    ls sites_chr*.vcf.gz | wc -l
+    echo "site files unpacked: $(ls sites_chr*.vcf.gz | wc -l)"
 
     # htslib expects an index beside its data file.
     ln -s ~{cram} ./sample.cram
@@ -132,7 +140,7 @@ task SampleGL {
       T0=$(date +%s)
 
       # -I skips indels, -E recomputes BAQ, -T restricts the pileup to panel
-      # sites. call -C alleles forces the panel's REF/ALT instead of letting
+      # sites. call -C alleles forces the panel's REF/ALT rather than letting
       # bcftools infer them from the reads, which is what GLIMPSE2 assumes.
       bcftools mpileup \
         -f ~{ref_fasta} \
@@ -147,16 +155,19 @@ task SampleGL {
       bcftools index -f gl/~{sid}.${CHR}.bcf
 
       T1=$(date +%s)
-      N=$(bcftools index -n gl/~{sid}.${CHR}.bcf)
-      echo -e "~{sid}\t${CHR}\t$((T1-T0))\t${N}" >> timing.txt
-      echo "~{sid} ${CHR}: $((T1-T0))s, ${N} sites"
+      N_OUT=$(bcftools index -n gl/~{sid}.${CHR}.bcf)
+      N_SITE=$(bcftools index -n ./sites_${CHR}.vcf.gz)
+      echo -e "~{sid}\t${CHR}\t$((T1-T0))\t${N_OUT}\t${N_SITE}" >> timing.txt
+      echo "~{sid} ${CHR}: $((T1-T0))s, ${N_OUT}/${N_SITE} sites called"
     done
 
     tar czf ~{sid}.gl.tar.gz -C gl .
+
+    echo "=== summary ==="
     ls -lh ~{sid}.gl.tar.gz
-    echo "=== timing ==="
     cat timing.txt
-    awk -F'\t' '{s+=$3} END {print "total:", s, "sec"}' timing.txt
+    awk -F'\t' '{s+=$3; o+=$4; p+=$5}
+      END {printf "total %ds | called %d / panel %d (%.1f%%)\n", s, o, p, 100*o/p}' timing.txt
   >>>
 
   runtime {
@@ -164,10 +175,11 @@ task SampleGL {
     cpu: 2
     memory: "8 GB"
     disks: "local-disk ~{disk_gb} SSD"
-    # Whole-genome pileup runs long enough that preemption wastes real work,
-    # but a single retry is cheaper than paying full price for every shard.
-    preemptible: 1
-    maxRetries: 2
+    # Whole-genome pileup is long enough that preemption costs more in
+    # wasted restarts than it saves; PrepareReference lost three hours to
+    # two reclaims on a 1.5 h task.
+    preemptible: 0
+    maxRetries: 1
   }
 
   output {
