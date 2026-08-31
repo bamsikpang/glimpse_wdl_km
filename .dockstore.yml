@@ -12,3 +12,7 @@ workflows:
     subclass: WDL
     primaryDescriptorPath: /RepackGL.wdl
     publish: true
+  - name: PhaseLigate
+    subclass: WDL
+    primaryDescriptorPath: /PhaseLigate.wdl
+    publish: true
