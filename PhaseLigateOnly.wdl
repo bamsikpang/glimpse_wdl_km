@@ -6,13 +6,17 @@ version 1.0
 ## GLIMPSE2_phase over each chunk, then GLIMPSE2_ligate to stitch them back
 ## into a whole-chromosome callset.
 ##
-## Splitting this out of PhaseLigate lets the chr22 merge that already
-## succeeded be reused rather than repeating its 2h40m of localizing 4,840
-## per-sample files.
+## Splitting this out of PhaseLigate lets a merge that already succeeded be
+## reused rather than repeating the ~2h40m of localizing 4,840 per-sample
+## files.
 ##
-## The bcftools image ships BusyBox coreutils, and `set -o pipefail` turns a
-## SIGPIPE from a truncated pipe into a task failure, so any `... | head` is
-## written through a temp file instead.
+## Two things about the environment shape the shell below. The bcftools image
+## ships BusyBox coreutils, and `set -o pipefail` turns a SIGPIPE from a
+## truncated pipe into a task failure, so every `... | head` is written
+## through a temp file. And GLIMPSE2_split_reference appends its own
+## _chrom_start_end to whatever output prefix it was handed, so the binary
+## reference files carry the chromosome twice: reference_chr22_chr22_1_*.bin.
+## Matching on the coordinates alone sidesteps that.
 
 workflow PhaseLigateOnly {
   input {
@@ -122,20 +126,22 @@ task Phase {
     ln -s ~{merged_csi} ./merged.bcf.csi
 
     tar xzf ~{ref_bins_tar}
-    # PrepareReference tarred these under refbins/; flatten so the name match
+    # PrepareReference tarred these under refbins/; flatten so the lookup
     # below does not depend on that layout.
     find . -name "reference_*.bin" -exec mv {} . \; 2>/dev/null || true
     ls reference_*.bin > binlist.txt
     echo "reference bins: $(wc -l < binlist.txt)"
     head -3 binlist.txt
 
-    # split_reference named each file after the region it covers, so the
-    # buffered coordinates from chunks.txt recover the right one.
+    # Match on the buffered coordinates rather than reconstructing the whole
+    # filename: split_reference wrote reference_<prefix>_<chrom>_<start>_<end>
+    # and the prefix already contained the chromosome.
     IRG_START=$(echo "~{input_region}" | sed 's/.*://; s/-.*//')
     IRG_END=$(echo "~{input_region}" | sed 's/.*-//')
-    BIN=$(ls reference_~{chrom}_${IRG_START}_${IRG_END}.bin 2>/dev/null || true)
+    grep "_${IRG_START}_${IRG_END}\.bin$" binlist.txt > match.txt || true
+    BIN=$(head -1 match.txt)
     if [ -z "$BIN" ]; then
-      echo "no exact match for ${IRG_START}_${IRG_END}; available:"
+      echo "no match for ${IRG_START}_${IRG_END}; available:"
       cat binlist.txt
       exit 1
     fi
