@@ -8,4 +8,7 @@ workflows:
     subclass: WDL
     primaryDescriptorPath: /ComputeGL.wdl
     publish: true
-    
+  - name: RepackGL
+    subclass: WDL
+    primaryDescriptorPath: /RepackGL.wdl
+    publish: true
