@@ -9,6 +9,9 @@ version 1.0
 ## Chunk boundaries come from the chunks_chrN.txt that PrepareReference wrote,
 ## so the scatter width is whatever GLIMPSE2_chunk decided: 440 chunks across
 ## the 22 autosomes, from 7 on chr22 to 36 on chr1.
+##
+## The bcftools image ships BusyBox coreutils, so the shell here sticks to
+## what BusyBox implements: no `split -d`, no process substitution.
 
 workflow PhaseLigate {
   input {
@@ -44,23 +47,23 @@ workflow PhaseLigate {
     scatter (ck in ReadChunks.rows) {
       call Phase {
         input:
-          chrom         = c,
-          chunk_id      = ck[0],
-          input_region  = ck[2],
-          merged_bcf    = MergeGL.merged_bcf,
-          merged_csi    = MergeGL.merged_csi,
-          ref_bins_tar  = panel_dir + "/refbins_" + c + ".tar.gz",
-          docker        = glimpse_docker
+          chrom        = c,
+          chunk_id     = ck[0],
+          input_region = ck[2],
+          merged_bcf   = MergeGL.merged_bcf,
+          merged_csi   = MergeGL.merged_csi,
+          ref_bins_tar = panel_dir + "/refbins_" + c + ".tar.gz",
+          docker       = glimpse_docker
       }
     }
 
     call Ligate {
       input:
-        chrom        = c,
-        chunk_bcfs   = Phase.phased_bcf,
-        chunk_csis   = Phase.phased_csi,
-        maf_out      = maf_out,
-        docker       = glimpse_docker
+        chrom      = c,
+        chunk_bcfs = Phase.phased_bcf,
+        chunk_csis = Phase.phased_csi,
+        maf_out    = maf_out,
+        docker     = glimpse_docker
     }
   }
 
@@ -136,10 +139,13 @@ task MergeGL {
     ls work/*.bcf | sort > work_bcfs.txt
     echo "linked: $(wc -l < work_bcfs.txt)"
 
-    # bcftools merge holds every input open at once; 2,420 exceeds the usual
-    # 1024-descriptor ceiling, so merge in batches and then merge the batches.
+    # bcftools merge holds every input open at once and 2,420 exceeds the
+    # usual 1024-descriptor ceiling, so merge in batches and then merge the
+    # batches. BusyBox split has no -d, hence awk.
     mkdir -p batches
-    split -l ~{batch_size} -d -a 3 work_bcfs.txt batches/part_
+    awk -v n=~{batch_size} '{
+      printf("%s\n", $0) > sprintf("batches/part_%03d", int((NR-1)/n))
+    }' work_bcfs.txt
     N_BATCH=$(ls batches/part_* | wc -l)
     echo "batches: $N_BATCH"
 
@@ -163,10 +169,11 @@ task MergeGL {
     # the filename (ABN-KR11-PT-00001). bcftools merge preserves input order,
     # so the sorted filename list gives the replacement names directly.
     awk -F/ '{print $NF}' work_bcfs.txt | cut -d. -f1 > newnames.txt
-    paste <(bcftools query -l merged_raw.bcf) newnames.txt > rename_~{chrom}.map
+    bcftools query -l merged_raw.bcf > oldnames.txt
+    paste oldnames.txt newnames.txt > rename_~{chrom}.map
     echo "rename map (first 3):"
     head -3 rename_~{chrom}.map
-    echo "names to apply: $(wc -l < newnames.txt)"
+    echo "old $(wc -l < oldnames.txt) / new $(wc -l < newnames.txt)"
 
     bcftools reheader -s newnames.txt -o merged_~{chrom}.bcf merged_raw.bcf
     bcftools index -f merged_~{chrom}.bcf
