@@ -2,26 +2,39 @@ version 1.0
 
 ## PhaseLigate.wdl
 ##
-## Third and last Cromwell stage: merge the per-sample genotype likelihoods
-## into one BCF per chromosome, run GLIMPSE2_phase over each chunk, and
-## ligate the chunks back into a whole-chromosome imputed callset.
+## Merges the per-sample genotype likelihoods into one BCF per chromosome,
+## runs GLIMPSE2_phase over each chunk, and ligates the chunks back into a
+## whole-chromosome imputed callset.
 ##
 ## Chunk boundaries come from the chunks_chrN.txt that PrepareReference wrote,
-## so the scatter width is whatever GLIMPSE2_chunk decided: 440 chunks across
-## the 22 autosomes, from 7 on chr22 to 36 on chr1.
+## so the scatter width is whatever GLIMPSE2_chunk decided: 433 chunks across
+## chr1-chr21, from 7 on chr21 to 36 on chr1.
 ##
-## The bcftools image ships BusyBox coreutils, so the shell here sticks to
-## what BusyBox implements: no `split -d`, no process substitution.
+## Four things learned from the chr22 run are baked in here.
+##
+## The bcftools image ships BusyBox coreutils, so `split -d` is unavailable
+## and the batching is done with awk. `set -o pipefail` turns a SIGPIPE from
+## a truncated pipe into a task failure, so every `... | head` writes through
+## a temp file first. GLIMPSE2_split_reference appends its own
+## _chrom_start_end to whatever output prefix it received, leaving filenames
+## that carry the chromosome twice, so the binary reference lookup matches on
+## coordinates alone. And the CRAMs carry their original delivery IDs while
+## the phenotype tables use a normalized form, so samples are renamed after
+## the merge.
 
 workflow PhaseLigate {
   input {
-    Array[String] chroms = ["chr22"]
+    Array[String] chroms = ["chr1","chr2","chr3","chr4","chr5","chr6","chr7",
+                            "chr8","chr9","chr10","chr11","chr12","chr13",
+                            "chr14","chr15","chr16","chr17","chr18","chr19",
+                            "chr20","chr21"]
 
     String bcflist_dir              # holds chrN.txt and chrN.csi.txt
     String panel_dir                # holds chunks_chrN.txt and refbins_chrN.tar.gz
 
     Int    merge_batch = 400
-    Float  maf_out     = 0.001      # post-imputation MAF floor for the filtered copy
+    Float  maf_out     = 0.01       # post-imputation MAF floor for the filtered copy
+    Float  info_min    = 0.8        # IMPUTE-style quality floor
 
     String bcftools_docker = "quay.io/biocontainers/bcftools:1.19--h8b25389_1"
     String glimpse_docker  = "simrub/glimpse:v2.0.0-27-g0919952_20221207"
@@ -63,6 +76,7 @@ workflow PhaseLigate {
         chunk_bcfs = Phase.phased_bcf,
         chunk_csis = Phase.phased_csi,
         maf_out    = maf_out,
+        info_min   = info_min,
         docker     = glimpse_docker
     }
   }
@@ -130,9 +144,9 @@ task MergeGL {
     cat ~{write_lines(csis)} > csi_paths.txt
     echo "bcfs: $(wc -l < bcf_paths.txt)  csis: $(wc -l < csi_paths.txt)"
 
-    # An index has to sit beside its data file, and Cromwell scatters each
-    # localized input into its own directory. Rebuild a flat working
-    # directory of symlinks so htslib can pair them.
+    # An index has to sit beside its data file, and Cromwell localizes each
+    # input into its own directory. Rebuild a flat working directory of
+    # symlinks so htslib can pair them.
     mkdir -p work
     while read -r B; do ln -sf "$B" work/$(basename "$B"); done < bcf_paths.txt
     while read -r C; do ln -sf "$C" work/$(basename "$C"); done < csi_paths.txt
@@ -164,9 +178,9 @@ task MergeGL {
     fi
     bcftools index -f merged_raw.bcf
 
-    # The CRAMs carried their original delivery IDs (ABN-K11-PT-0001) while
+    # The CRAMs carried their original delivery IDs (ABN-K1-HC-00001) while
     # the manifest and phenotype tables use the normalized form sitting in
-    # the filename (ABN-KR11-PT-00001). bcftools merge preserves input order,
+    # the filename (ABN-KR1-HC-00001). bcftools merge preserves input order,
     # so the sorted filename list gives the replacement names directly.
     awk -F/ '{print $NF}' work_bcfs.txt | cut -d. -f1 > newnames.txt
     bcftools query -l merged_raw.bcf > oldnames.txt
@@ -178,14 +192,15 @@ task MergeGL {
     bcftools reheader -s newnames.txt -o merged_~{chrom}.bcf merged_raw.bcf
     bcftools index -f merged_~{chrom}.bcf
 
-    NS=$(bcftools query -l merged_~{chrom}.bcf | wc -l)
+    bcftools query -l merged_~{chrom}.bcf > samplenames.txt
+    NS=$(wc -l < samplenames.txt)
     NV=$(bcftools index -n merged_~{chrom}.bcf)
     echo "merged ~{chrom}: $NS samples, $NV variants" | tee merge_~{chrom}.log
-    bcftools query -l merged_~{chrom}.bcf | head -3
+    head -3 samplenames.txt
 
     # GLIMPSE2 reads PL or GL; confirm the field survived the merge.
-    bcftools view -h merged_~{chrom}.bcf | grep -E "FORMAT=<ID=(PL|GL)" \
-      || echo "WARNING: no PL/GL in FORMAT"
+    bcftools view -h merged_~{chrom}.bcf > hdr.txt
+    grep -E "FORMAT=<ID=(PL|GL)" hdr.txt || echo "WARNING: no PL/GL in FORMAT"
   >>>
 
   runtime {
@@ -193,6 +208,8 @@ task MergeGL {
     cpu: 4
     memory: "16 GB"
     disks: "local-disk ~{disk_gb} SSD"
+    # Localizing 4,840 per-sample files ran 2h40m for chr22 alone; a reclaim
+    # partway through would throw all of that away.
     preemptible: 0
     maxRetries: 1
   }
@@ -222,7 +239,8 @@ task Phase {
   command <<<
     set -euo pipefail
 
-    ls -1 /usr/local/bin /usr/bin /opt/*/bin 2>/dev/null | grep -i glimpse || true
+    ls -1 /usr/local/bin /usr/bin /opt/*/bin 2>/dev/null > allbin.txt || true
+    grep -i glimpse allbin.txt || true
     PHASE=$(command -v GLIMPSE2_phase_static || command -v GLIMPSE2_phase)
     echo "phase=$PHASE"
 
@@ -230,19 +248,23 @@ task Phase {
     ln -s ~{merged_csi} ./merged.bcf.csi
 
     tar xzf ~{ref_bins_tar}
-    # PrepareReference tarred these under refbins/; flatten so the name match
+    # PrepareReference tarred these under refbins/; flatten so the lookup
     # below does not depend on that layout.
     find . -name "reference_*.bin" -exec mv {} . \; 2>/dev/null || true
-    ls reference_*.bin | head -3
+    ls reference_*.bin > binlist.txt
+    echo "reference bins: $(wc -l < binlist.txt)"
+    head -3 binlist.txt
 
-    # split_reference named each file after the region it covers, so the
-    # buffered coordinates from chunks.txt recover the right one.
+    # Match on the buffered coordinates rather than rebuilding the filename:
+    # split_reference wrote reference_<prefix>_<chrom>_<start>_<end> and the
+    # prefix already ended in the chromosome, so the name has it twice.
     IRG_START=$(echo "~{input_region}" | sed 's/.*://; s/-.*//')
     IRG_END=$(echo "~{input_region}" | sed 's/.*-//')
-    BIN=$(ls reference_~{chrom}_${IRG_START}_${IRG_END}.bin 2>/dev/null || true)
+    grep "_${IRG_START}_${IRG_END}\.bin$" binlist.txt > match.txt || true
+    BIN=$(head -1 match.txt)
     if [ -z "$BIN" ]; then
-      echo "no exact match for ${IRG_START}_${IRG_END}; available:"
-      ls reference_~{chrom}_*.bin
+      echo "no match for ${IRG_START}_${IRG_END}; available:"
+      cat binlist.txt
       exit 1
     fi
     echo "using $BIN"
@@ -262,8 +284,8 @@ task Phase {
     cpu: 4
     memory: "32 GB"
     disks: "local-disk ~{disk_gb} SSD"
-    # Phasing thousands of samples over a multi-megabase chunk runs long
-    # enough that a reclaim costs more than the discount saves.
+    # chr22 chunks took 4.8 to 7.3 hours at 2,420 samples, far past the point
+    # where preemption pays for itself.
     preemptible: 0
     maxRetries: 1
   }
@@ -281,10 +303,12 @@ task Ligate {
     Array[File] chunk_bcfs
     Array[File] chunk_csis
     Float       maf_out
+    Float       info_min
     String      docker
   }
 
-  Int disk_gb = ceil(size(chunk_bcfs, "GB") * 4 + 60)
+  Float maf_max = 1.0 - maf_out
+  Int   disk_gb = ceil(size(chunk_bcfs, "GB") * 4 + 60)
 
   command <<<
     set -euo pipefail
@@ -307,17 +331,23 @@ task Ligate {
 
     NV=$(bcftools index -n ~{chrom}_imputed.bcf)
     echo "$NV" > n_variants.txt
-    echo "ligated ~{chrom}: $NV variants, $(bcftools query -l ~{chrom}_imputed.bcf | wc -l) samples"
+    bcftools query -l ~{chrom}_imputed.bcf > samples.txt
+    echo "ligated ~{chrom}: $NV variants, $(wc -l < samples.txt) samples"
+    head -3 samples.txt
 
-    # A MAF-filtered copy for downstream PRS work. INFO score is not usable
-    # as a filter here: in a BGE design the same reads feed both the
-    # likelihoods and the imputation, so it saturates for nearly every site.
-    bcftools view -q ~{maf_out}:minor -Ob -o ~{chrom}_common.bcf ~{chrom}_imputed.bcf
+    # GLIMPSE2 derives INFO/AF from the dosages and INFO/INFO as an
+    # IMPUTE-style quality score. Filtering on GT instead would throw away
+    # low-frequency sites whose hard calls all collapse to 0/0. The quality
+    # score was saturated in a 516-sample subset but separates properly
+    # across all 2,420 (chr22 mean 0.861), so it earns a place here.
+    bcftools view \
+      -i 'INFO/AF >= ~{maf_out} && INFO/AF <= ~{maf_max} && INFO/INFO >= ~{info_min}' \
+      -Ob -o ~{chrom}_common.bcf ~{chrom}_imputed.bcf
     bcftools index -f ~{chrom}_common.bcf
 
     NC=$(bcftools index -n ~{chrom}_common.bcf)
     echo "$NC" > n_common.txt
-    echo "after MAF >= ~{maf_out}: $NC variants"
+    echo "after MAF >= ~{maf_out} and INFO >= ~{info_min}: $NC variants"
   >>>
 
   runtime {
