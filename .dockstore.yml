@@ -16,3 +16,7 @@ workflows:
     subclass: WDL
     primaryDescriptorPath: /PhaseLigate.wdl
     publish: true
+  - name: PhaseLigateOnly
+    subclass: WDL
+    primaryDescriptorPath: /PhaseLigateOnly.wdl
+    publish: true
