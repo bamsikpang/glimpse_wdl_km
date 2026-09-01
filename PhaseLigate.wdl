@@ -33,7 +33,7 @@ workflow PhaseLigate {
     String panel_dir                # holds chunks_chrN.txt and refbins_chrN.tar.gz
 
     Int    merge_batch = 400
-    Float  maf_out     = 0.01       # post-imputation MAF floor for the filtered copy
+    Float  maf_out     = 0.001       # post-imputation MAF floor for the filtered copy
     Float  info_min    = 0.8        # IMPUTE-style quality floor
 
     String bcftools_docker = "quay.io/biocontainers/bcftools:1.19--h8b25389_1"
